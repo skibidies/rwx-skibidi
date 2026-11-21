@@ -294,7 +294,7 @@ class Selector:
         out = set()
         for f, nums in self.m.reader_tests.items():
             if f.startswith(prefix):
-                out |= nums
+                out |= set(nums)
         return out
 
     def tests_referencing(self, name):
@@ -305,12 +305,21 @@ class Selector:
         return out
 
     def fixture_tests(self, path):
-        out = set(self.m.fixtures.get(path, ()))
-        if not out:
-            prefix = path.rsplit("/", 1)[0] + "/"
-            for fx, nums in self.m.fixtures.items():
-                if fx.startswith(prefix):
-                    out |= nums
+        """Tests that load a fixture file. Map keys are relative to
+        tests/fixtures/; an unlisted (new) fixture takes its whole directory,
+        since loaders often enumerate."""
+        keys = [path]
+        if path.startswith("tests/fixtures/"):
+            keys.append(path[len("tests/fixtures/"):])
+        out = set()
+        for key in keys:
+            out |= set(self.m.fixtures.get(key, ()))
+        if out:
+            return out
+        prefixes = [k.rsplit("/", 1)[0] + "/" if "/" in k else "" for k in keys]
+        for fx, nums in self.m.fixtures.items():
+            if any(prefix and fx.startswith(prefix) for prefix in prefixes):
+                out |= set(nums)
         return out
 
     # -- per commit -------------------------------------------------------
@@ -342,7 +351,10 @@ class Selector:
             return selected
 
         if path.startswith("tests/fixtures/") or "/fixtures/" in path:
-            selected |= self.fixture_tests(path)
+            if not selected:
+                # no recorded reader: a new or renamed fixture, of which the
+                # loaders often read whole directories
+                selected |= self.fixture_tests(path)
             return selected
 
         if not path.endswith(".py"):
@@ -793,7 +805,15 @@ class Selector:
                 if len(refs) > REF_CAP:
                     return True
             selected |= refs
-            return False
+            # removing or renaming a name also breaks every test file that
+            # imports it by name, which importing this module cannot reveal
+            # removing or renaming a name also breaks every test file that
+            # imports it by name, which importing this module cannot reveal
+            old_name = _name_defined(text)
+            if new_text is None:
+                return old_name is not None
+            new_name = _name_defined(new_text)
+            return bool(old_name and new_name and old_name != new_name)
 
         if ln == span[1] or ln < span[3]:
             # def / decorator / signature line: import-relevant only if the
@@ -922,6 +942,20 @@ DOCSTRING_STARTS = ('"""', "'''", 'r"""', "r'''")
 def _is_docstring_line(text: str) -> bool:
     """A docstring line carries no behaviour (documentation is not a key)."""
     return text.strip().startswith(DOCSTRING_STARTS)
+
+
+def _name_defined(text: str):
+    """Name bound by a class/module-level line, or None."""
+    stripped = text.strip()
+    if not stripped or stripped.startswith(('#', '@', ')', ']', '}', '"""', "'''")):
+        return None
+    m = re.match(r"^(?:async\s+def|def|class)\s+(\w+)", stripped)
+    if m:
+        return m.group(1)
+    m = re.match(r"^(\w+)\s*(?::[^=]+)?=(?!=)", stripped)
+    if m:
+        return m.group(1)
+    return None
 
 
 def _def_name(text: str):
