@@ -261,6 +261,26 @@ def main():
             if hit and (node.lineno, node.col_offset) not in transparent:
                 (obs_str if weak else obs)[hit][rel].append(node.lineno)
 
+    # ---- symbol index: every name defined under sqlglot/, so an added
+    # reference can be checked without importing anything
+    symbols = set()
+    for rel, tree in trees.items():
+        if not rel.startswith("sqlglot/"):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbols.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    for sub in ast.walk(t):
+                        if isinstance(sub, ast.Name):
+                            symbols.add(sub.id)
+                        elif isinstance(sub, ast.Attribute):
+                            symbols.add(sub.attr)
+    with gzip.open(os.path.join(OUT, "symbols.json.gz"), "wt") as fh:
+        json.dump(sorted(symbols), fh, separators=(",", ":"))
+
     obs_json = {k: {f: sorted(set(v)) for f, v in m.items()} for k, m in obs.items()}
     obs_str_json = {k: {f: sorted(set(v)) for f, v in m.items()}
                     for k, m in obs_str.items()}

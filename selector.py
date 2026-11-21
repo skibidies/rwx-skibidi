@@ -33,6 +33,11 @@ SRC = Path(os.environ.get("BR_SRC", "/tmp/src"))
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 IMPORTER_CAP = 120  # above this, only readers are selected
+KEYWORDS = {"if", "else", "elif", "for", "while", "in", "not", "and", "or",
+            "return", "def", "class", "lambda", "yield", "import", "from", "as",
+            "with", "try", "except", "finally", "raise", "pass", "assert", "del",
+            "global", "nonlocal", "await", "async", "is", "break", "continue"}
+
 REF_CAP = 600  # fall back to importers when a constant's readers are everywhere
 UNCLASSIFIABLE_RE = re.compile(
     r"(^|/)(setup\.py|pyproject\.toml|MANIFEST\.in|Makefile|requirements\.lock)$"
@@ -100,6 +105,13 @@ class Maps:
         self.obs = obs.get("strong", obs)
         self.obs_str = obs.get("weak", {})
         self.flows = json.load(open(MAPS / "flows.json"))
+
+        # names defined under sqlglot/: lets an added reference be verified
+        # without paying for a real import
+        self.symbols = set()
+        sym = MAPS / "symbols.json.gz"
+        if sym.exists():
+            self.symbols = set(json.load(gzip.open(sym, "rt")))
 
         # container key observation: which keys a test actually reads
         self.keys = {}
@@ -538,14 +550,16 @@ class Selector:
                 return False
         return True
 
-    @staticmethod
-    def _needs_probe(h) -> bool:
-        """An added/removed name or attribute can fail the import (NameError,
-        AttributeError); plain literals cannot."""
+    def _needs_probe(self, h) -> bool:
+        """An added/removed reference to a name that does not exist under
+        sqlglot/ can fail the import (NameError, AttributeError). Names we can
+        see in the tree, and plain literals, cannot: skip the probe and its
+        CPU cost."""
         for _ln, text in h["add"] + h["del"]:
             code = re.sub(r"(['\"]).*?\1", "''", text.split("#", 1)[0])
-            if re.search(r"[A-Za-z_]\w*\s*[(.]", code) or re.search(r"\w+\s*\.\s*\w+", code):
-                return True
+            for name in re.findall(r"[A-Za-z_]\w*", code):
+                if name not in self.m.symbols and name not in KEYWORDS:
+                    return True
         return False
 
     def _value_line(self, path, spans, ln, stmt, selected, changed_texts=()) -> bool:
