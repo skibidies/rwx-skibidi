@@ -406,6 +406,8 @@ class Selector:
         """Value-only change of a module/class-level literal: the tests that
         notice are the ones covering the constant's readers (through the
         value-flow map). Returns False when the map cannot carry the case."""
+        if self._has_string_literal_anywhere(stmt):
+            return False  # string values are handles too: use the broad rules
         selected |= self.tests_for_lines(path, [ln])
         selected |= self.tests_for_span(path, innermost_span(
             [s for s in spans if s[0] == "e"], ln))
@@ -421,17 +423,43 @@ class Selector:
                     names.add(sub.attr)
         if not names:
             return False
+        importers = self.tests_importing(path)
         out: set[int] = set()
+        import_time = False
         for name in self._flow_closure(names):
             for f, lines in self.m.obs.get(name, {}).items():
+                if f == path:
+                    out |= self.tests_for_lines(f, lines)
+                    continue
+                if any(not self._inside_function(self.m.scopes.get(f, []), l)
+                       for l in lines):
+                    # a module/class-level reader runs at import time, where
+                    # coverage is not attributed per test: any importer can
+                    # notice it
+                    import_time = True
                 out |= self.tests_for_lines(f, lines)
-        # a reader can only see this constant if it loaded the defining
-        # module: the read sites themselves are often shared and hot
-        out &= self.tests_importing(path)
+        if import_time:
+            out |= importers
+        else:
+            # a reader can only see this constant if it loaded the defining
+            # module: the read sites themselves are often shared and hot
+            out &= importers
         if len(out) > REF_CAP:
             return False  # too broad to trust the refinement: use the old rules
         selected |= out
         return True
+
+    @staticmethod
+    def _has_string_literal_anywhere(stmt) -> bool:
+        """True when the assigned value mentions a string literal (or is not a
+        plain assignment): then the broad rules are used instead."""
+        if isinstance(stmt, ast.Assign):
+            value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign):
+            value = stmt.value
+        else:
+            return True
+        return value is None or _has_string_literal(value)
 
     def _imports_ok(self, path, new_text) -> bool:
         """Real import probe of the patched module (module/class-level change
@@ -610,10 +638,18 @@ def detect_swap(stmt_old, stmt_new):
 
 
 class _NormConst(ast.NodeTransformer):
-    """Replace constants with a marker: dumps compare equal when only literal
-    values changed (a value change cannot break an import)."""
+    """Replace literal values with a marker: dumps compare equal when only
+    literal values changed. Dict keys are left alone (a key is a lookup
+    handle, so changing it changes behaviour), and strings are treated as
+    significant too."""
+
+    def visit_Dict(self, node):
+        node.values = [self.visit(v) for v in node.values]
+        return node
 
     def visit_Constant(self, node):
+        if isinstance(node.value, str):
+            return node
         return ast.copy_location(ast.Constant(value="<const>"), node)
 
 
@@ -625,6 +661,21 @@ def _value_only(stmt_old, stmt_new):
                ast.dump(_NormConst().visit(stmt_new), include_attributes=False)
     except Exception:
         return False
+
+
+def _has_string_literal(node) -> bool:
+    """Any non-key string literal in the value expression (dict keys are
+    lookup handles, handled by _NormConst keeping them significant)."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, ast.Dict):
+            stack.extend(cur.values)
+            continue
+        if isinstance(cur, ast.Constant) and isinstance(cur.value, str):
+            return True
+        stack.extend(ast.iter_child_nodes(cur))
+    return False
 
 
 def innermost_stmt(tree, line):
