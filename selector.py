@@ -22,6 +22,7 @@ import gzip
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -283,18 +284,24 @@ class Selector:
         new_lines = apply_hunks(old_lines, info["hunks"]) if old_lines else [
             t for h in info["hunks"] for t in h["newtext"]
         ]
+        new_text = "\n".join(new_lines)
 
         if old_text is not None and not info["new_file"]:
             sa = ast_signature(old_text)
-            sb = ast_signature("\n".join(new_lines))
+            sb = ast_signature(new_text)
             if sa is not None and sa == sb:
                 return selected  # comment/blank-only: behaviour unchanged
+
+        # a file that cannot be imported fails every test that needs it
+        if old_text is not None and parse_tree(new_text) is None:
+            return selected | self.tests_importing(path)
 
         spans = self.m.scopes.get(path, [])
         need_import = False
         add_points = []
         old_tree = parse_tree(old_text) if old_text is not None else None
-        new_tree = parse_tree("\n".join(new_lines))
+        new_tree = parse_tree(new_text)
+        import_unsafe = False
 
         for h in info["hunks"]:
             dels, adds = h["del"], h["add"]
@@ -306,15 +313,29 @@ class Selector:
                     if got is not None:
                         selected |= got
                         continue
+                if executable(dtext) or executable(atext):
+                    if not self._inside_function(spans, ln) and not _value_only(
+                            innermost_stmt(old_tree, ln) if old_tree is not None else None,
+                            innermost_stmt(new_tree, nln) if new_tree is not None else None):
+                        import_unsafe = True
                 if executable(dtext):
                     need_import |= self._old_line(path, spans, ln, dtext, selected)
                 elif executable(atext):
                     add_points.append(ln)
             for ln, dtext in dels[k:]:
                 if executable(dtext):
+                    if not self._inside_function(spans, ln):
+                        import_unsafe = True
                     need_import |= self._old_line(path, spans, ln, dtext, selected)
             if len(adds) > k:
                 add_points.append(dels[-1][0] if dels else h["old"])
+
+        # module/class-level changes can break the import (name errors, bad
+        # imports). Probe the patched module: if it no longer imports, every
+        # test that needs the file fails, whatever line changed.
+        if import_unsafe and old_text is not None:
+            if not self._imports_ok(path, new_text):
+                return selected | self.tests_importing(path)
 
         for point in add_points:
             span = innermost_span(spans, point + 1) or innermost_span(spans, point)
@@ -333,6 +354,43 @@ class Selector:
             if not selected and UNCLASSIFIABLE_RE.search(path):
                 selected |= set(self.m.all_numbers)
         return selected
+
+    @staticmethod
+    def _inside_function(spans, ln) -> bool:
+        return any(s[0] == "f" and s[1] <= ln <= s[2] for s in spans)
+
+    def _imports_ok(self, path, new_text) -> bool:
+        """Real import probe of the patched module (module/class-level change
+        that is not a plain literal value swap). Tests fail wholesale when a
+        file cannot be imported, so this decides that case exactly."""
+        target = SRC / path
+        try:
+            orig = target.read_bytes()
+        except OSError:
+            return True  # unknown file: keep the normal rules
+        if path.startswith("tests/"):
+            return False  # test modules: a broken import fails the whole file
+        mod = path[:-3].replace("/", ".")
+        if mod.endswith("."):
+            mod = path[:-len("/__init__.py")].replace("/", ".")
+        if "__main__" in mod:
+            return False  # cannot probe safely: take the importers
+        code = f"import importlib; importlib.import_module({mod!r})"
+        try:
+            target.write_text(new_text)
+            r = subprocess.run(
+                [sys.executable, "-c", code], cwd=str(SRC),
+                capture_output=True, timeout=25,
+                env={**os.environ, "PYTHONPATH": str(SRC), "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            return r.returncode == 0
+        except Exception:
+            return False  # cannot prove it imports: take the importers
+        finally:
+            try:
+                target.write_bytes(orig)
+            except OSError:
+                pass
 
     def _swap_tests(self, path, ln, nln, old_tree, new_tree):
         """If the changed line pair is a pure comparison-operator swap, the
@@ -475,6 +533,24 @@ def detect_swap(stmt_old, stmt_new):
     except Exception:
         return None
     return OP_UNIVERSE[n_op]
+
+
+class _NormConst(ast.NodeTransformer):
+    """Replace constants with a marker: dumps compare equal when only literal
+    values changed (a value change cannot break an import)."""
+
+    def visit_Constant(self, node):
+        return ast.copy_location(ast.Constant(value="<const>"), node)
+
+
+def _value_only(stmt_old, stmt_new):
+    if stmt_old is None or stmt_new is None:
+        return False
+    try:
+        return ast.dump(_NormConst().visit(stmt_old), include_attributes=False) == \
+               ast.dump(_NormConst().visit(stmt_new), include_attributes=False)
+    except Exception:
+        return False
 
 
 def innermost_stmt(tree, line):
