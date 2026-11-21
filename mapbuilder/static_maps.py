@@ -8,6 +8,7 @@
 """
 
 import ast
+import gzip
 import json
 import os
 from collections import defaultdict
@@ -170,6 +171,94 @@ def main():
                 refs[hit][rel].append(node.lineno)
     refs_json = {k: {f: sorted(set(v)) for f, v in m.items()} for k, m in refs.items()}
 
+    # ---- value-flow map: a changed literal value is noticed only where the
+    # value is read; plain handoffs (assignments, keyword arguments) just
+    # carry it to another name. obs: name -> lines that READ it;
+    # flows: name -> names that receive its value.
+    obs = defaultdict(lambda: defaultdict(list))
+    flows = defaultdict(set)
+
+    def chain_names(node, acc):
+        """Names in a pure value chain: no calls, indexing or operators."""
+        if isinstance(node, ast.Name):
+            acc.add(node.id)
+            return True
+        if isinstance(node, ast.Attribute):
+            acc.add(node.attr)
+            return chain_names(node.value, acc)
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return all(chain_names(e, acc) for e in node.elts)
+        if isinstance(node, ast.Dict):
+            return (all(chain_names(k, acc) for k in node.keys if k is not None) and
+                    all(chain_names(v, acc) for v in node.values))
+        return False
+
+    def chain_positions(node, acc):
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.Name, ast.Attribute)):
+                acc.add((sub.lineno, sub.col_offset))
+        return acc
+
+    def simple_target(node, acc):
+        if isinstance(node, ast.Name):
+            acc.add(node.id)
+            return True
+        if isinstance(node, ast.Attribute):
+            root = node
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name):
+                acc.add(node.attr)
+                return True
+            return False
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return all(simple_target(e, acc) for e in node.elts)
+        return False
+
+    for rel, tree in trees.items():
+        if not (rel.startswith("sqlglot/") or rel.startswith("tests/")):
+            continue
+        transparent = set()  # (lineno, col) of occurrences that only carry a value
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                vnames = set()
+                tnames = set()
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                ok_targets = all(simple_target(t, tnames) for t in targets)
+                if node.value is None:
+                    for t in targets:
+                        chain_positions(t, transparent)
+                elif chain_names(node.value, vnames) and ok_targets:
+                    for v in vnames:
+                        flows[v] |= tnames
+                    chain_positions(node.value, transparent)
+                    for t in targets:
+                        chain_positions(t, transparent)
+            elif isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg is None:
+                        continue
+                    vnames = set()
+                    if chain_names(kw.value, vnames):
+                        for v in vnames:
+                            flows[v].add(kw.arg)
+                        chain_positions(kw.value, transparent)
+        for node in ast.walk(tree):
+            hit = None
+            if isinstance(node, ast.Name):
+                hit = node.id
+            elif isinstance(node, ast.Attribute):
+                hit = node.attr
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                hit = node.value
+            if hit and (node.lineno, node.col_offset) not in transparent:
+                obs[hit][rel].append(node.lineno)
+
+    obs_json = {k: {f: sorted(set(v)) for f, v in m.items()} for k, m in obs.items()}
+    flows_json = {k: sorted(v) for k, v in flows.items()}
+
     # ---- fixture -> tests
     fixture_root = os.path.join(SRC, "tests", "fixtures")
     fixture_files = []
@@ -245,8 +334,13 @@ def main():
         json.dump(scopes, fh, separators=(",", ":"))
     with open(os.path.join(OUT, "refs.json"), "w") as fh:
         json.dump(refs_json, fh, separators=(",", ":"))
-    for name in ("imports.json", "fixtures.json", "scopes.json", "refs.json"):
+    with gzip.open(os.path.join(OUT, "obs.json.gz"), "wt") as fh:
+        json.dump(obs_json, fh, separators=(",", ":"))
+    with open(os.path.join(OUT, "flows.json"), "w") as fh:
+        json.dump(flows_json, fh, separators=(",", ":"))
+    for name in ("imports.json", "fixtures.json", "scopes.json", "refs.json", "flows.json"):
         print(name, os.path.getsize(os.path.join(OUT, name)), "bytes")
+    print("obs.json.gz", os.path.getsize(os.path.join(OUT, "obs.json.gz")), "bytes")
     mapped = sum(1 for fx in fixture_files if fixtures_map.get(fx))
     print(f"fixture files mapped: {mapped} / {len(fixture_files)}")
     unmapped = [fx for fx in fixture_files if not fixtures_map.get(fx)]

@@ -94,6 +94,10 @@ class Maps:
         self.equiv_wrapped = {f: set(s) for f, s in equiv.get("_wrapped", {}).items()}
         self.equiv_skipped = {f: set(s) for f, s in equiv.get("_skipped", {}).items()}
 
+        # value-flow map: obs reads a name, flows carries it to another name
+        self.obs = json.load(gzip.open(MAPS / "obs.json.gz", "rt"))
+        self.flows = json.load(open(MAPS / "flows.json"))
+
     def is_known(self, path) -> bool:
         return (path in self.scopes or path in self.file_tests or path in self.numbers_by_file)
 
@@ -313,13 +317,20 @@ class Selector:
                     if got is not None:
                         selected |= got
                         continue
+                handled_value = False
                 if executable(dtext) or executable(atext):
-                    if not self._inside_function(spans, ln) and not _value_only(
-                            innermost_stmt(old_tree, ln) if old_tree is not None else None,
-                            innermost_stmt(new_tree, nln) if new_tree is not None else None):
-                        import_unsafe = True
+                    if not self._inside_function(spans, ln):
+                        s_old = innermost_stmt(old_tree, ln) if old_tree is not None else None
+                        s_new = innermost_stmt(new_tree, nln) if new_tree is not None else None
+                        if _value_only(s_old, s_new):
+                            # a literal value change: only the readers of the
+                            # constant can notice it
+                            handled_value = self._value_line(path, spans, ln, s_old, selected)
+                        if not handled_value:
+                            import_unsafe = True
                 if executable(dtext):
-                    need_import |= self._old_line(path, spans, ln, dtext, selected)
+                    if not handled_value:
+                        need_import |= self._old_line(path, spans, ln, dtext, selected)
                 elif executable(atext):
                     add_points.append(ln)
             for ln, dtext in dels[k:]:
@@ -359,6 +370,48 @@ class Selector:
     def _inside_function(spans, ln) -> bool:
         return any(s[0] == "f" and s[1] <= ln <= s[2] for s in spans)
 
+    def _flow_closure(self, names):
+        seen = set(names)
+        stack = list(names)
+        while stack:
+            n = stack.pop()
+            for h in self.m.flows.get(n, ()):
+                if h not in seen:
+                    seen.add(h)
+                    stack.append(h)
+        return seen
+
+    def _value_line(self, path, spans, ln, stmt, selected) -> bool:
+        """Value-only change of a module/class-level literal: the tests that
+        notice are the ones covering the constant's readers (through the
+        value-flow map). Returns False when the map cannot carry the case."""
+        selected |= self.tests_for_lines(path, [ln])
+        selected |= self.tests_for_span(path, innermost_span(
+            [s for s in spans if s[0] == "e"], ln))
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            return False
+        names: set[str] = set()
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        for t in targets:
+            for sub in ast.walk(t):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+                elif isinstance(sub, ast.Attribute):
+                    names.add(sub.attr)
+        if not names:
+            return False
+        out: set[int] = set()
+        for name in self._flow_closure(names):
+            for f, lines in self.m.obs.get(name, {}).items():
+                out |= self.tests_for_lines(f, lines)
+        # a reader can only see this constant if it loaded the defining
+        # module: the read sites themselves are often shared and hot
+        out &= self.tests_importing(path)
+        if len(out) > REF_CAP:
+            return False  # too broad to trust the refinement: use the old rules
+        selected |= out
+        return True
+
     def _imports_ok(self, path, new_text) -> bool:
         """Real import probe of the patched module (module/class-level change
         that is not a plain literal value swap). Tests fail wholesale when a
@@ -380,7 +433,7 @@ class Selector:
             target.write_text(new_text)
             r = subprocess.run(
                 [sys.executable, "-c", code], cwd=str(SRC),
-                capture_output=True, timeout=25,
+                capture_output=True, timeout=15,
                 env={**os.environ, "PYTHONPATH": str(SRC), "PYTHONDONTWRITEBYTECODE": "1"},
             )
             return r.returncode == 0

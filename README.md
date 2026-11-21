@@ -29,7 +29,12 @@ for module/class level and structural changes; reference-based sets for
 changed constants; AST-equal patches (comment-only) select nothing. A line
 pair differing only in one comparison operator is checked against the
 behaviour map: only tests that ever saw the two operators disagree can
-notice, and where both always agreed the swap is provably neutral. The
+notice, and where both always agreed the swap is provably neutral. A plain
+literal value change is noticed only where the value is read (value-flow
+map: assignments and keyword arguments just carry the value), intersected
+with the tests that could load the defining module. A patched file that no
+longer imports (syntax error, bad import at module level) fails every test
+that needs it — probed with a real import. The
 chosen set is packed across 1..8 workers minimizing `busiest + 2 s/worker`.
 
 Two instrumented-suite tricks make the maps complete: sqlglot's
@@ -44,10 +49,9 @@ alternative comparison operators and record which tests saw disagreement
 
 ## Local score
 
-`make sample` on the 30 sample commits: **110.0 simulated s, 0 misses**
+`make sample` on the 30 sample commits: **109.4 simulated s, 0 misses**
 (oracle with perfect knowledge: 94.4 s). Every commit that breaks tests is
-selected at exactly its oracle cost; the rest is under 8 s per commit except
-one constant change the rules cannot prove neutral.
+selected at exactly its oracle cost; the rest is under 8 s per commit.
 
 ## Build
 
