@@ -108,7 +108,8 @@ class Maps:
 
 
 def parse_patch(text: str):
-    """-> {path: {"hunks": [...], "new_file": bool, "deleted": bool}}"""
+    """-> {path: {"hunks": [...], "new_file": bool, "deleted": bool,
+                  "old_path": str|None}}  (path is the post-patch path)"""
     if text.endswith("\n"):
         text = text[:-1]
     files: dict[str, dict] = {}
@@ -117,13 +118,20 @@ def parse_patch(text: str):
         if line.startswith("diff --git "):
             m = re.match(r"diff --git a/(.*) b/(.*)$", line)
             path = m.group(2) if m else line.split()[-1][2:]
-            cur = {"hunks": [], "new_file": False, "deleted": False}
+            cur = {"hunks": [], "new_file": False, "deleted": False, "old_path": None}
             files[path] = cur
+        elif line.startswith("rename from "):
+            if cur is not None:
+                cur["old_path"] = line[len("rename from "):].strip()
         elif line.startswith("--- "):
-            if cur is not None and "/dev/null" in line:
-                cur["new_file"] = True
+            if cur is not None:
+                name = line[4:].strip()
+                if name == "/dev/null":
+                    cur["new_file"] = True
+                elif name.startswith("a/"):
+                    cur["old_path"] = name[2:]
         elif line.startswith("+++ "):
-            if cur is not None and "/dev/null" in line:
+            if cur is not None and line[4:].strip() == "/dev/null":
                 cur["deleted"] = True
         elif line.startswith("@@") and cur is not None:
             m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
@@ -269,6 +277,22 @@ class Selector:
     def select_file(self, path, info):
         selected: set[int] = set()
         selected |= self.tests_reading(path)  # text readers see any edit
+        old_path = info.get("old_path") or path
+        if old_path != path:
+            # a rename/move: every test that imported or read the old path
+            # can break, and the new path is a fresh module
+            selected |= self.tests_reading(old_path)
+            selected |= self.tests_importing(old_path)
+            selected |= self.fixture_tests(old_path)
+        if info.get("deleted"):
+            # a deleted module/file fails every test that needs it
+            selected |= self.tests_reading(old_path)
+            selected |= self.fixture_tests(old_path)
+            if old_path.endswith(".py"):
+                selected |= self.tests_importing(old_path)
+            elif not selected:
+                selected |= self.tests_reading_dir(old_path)
+            return selected
 
         if path.startswith("tests/fixtures/") or "/fixtures/" in path:
             selected |= self.fixture_tests(path)
@@ -282,7 +306,7 @@ class Selector:
                 selected |= self.tests_reading_dir(path)
             return selected
 
-        old_src = SRC / path
+        old_src = SRC / old_path
         old_text = old_src.read_text() if old_src.exists() else None
         old_lines = old_text.split("\n") if old_text is not None else []
         new_lines = apply_hunks(old_lines, info["hunks"]) if old_lines else [
@@ -358,9 +382,6 @@ class Selector:
         if need_import:
             selected |= self.tests_importing(path)
         if not selected and not self.m.is_known(path):
-            # no map data for this file (e.g. sqlglotc sources, build config):
-            # take the tests that read around it, and if we still have no
-            # signal at all, run everything rather than risk a 300 s miss
             selected |= self.tests_reading_dir(path)
             if not selected and UNCLASSIFIABLE_RE.search(path):
                 selected |= set(self.m.all_numbers)
