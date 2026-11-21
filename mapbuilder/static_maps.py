@@ -176,6 +176,7 @@ def main():
     # carry it to another name. obs: name -> lines that READ it;
     # flows: name -> names that receive its value.
     obs = defaultdict(lambda: defaultdict(list))
+    obs_str = defaultdict(lambda: defaultdict(list))
     flows = defaultdict(set)
 
     def chain_names(node, acc):
@@ -246,17 +247,23 @@ def main():
                             flows[v].add(kw.arg)
                         chain_positions(kw.value, transparent)
         for node in ast.walk(tree):
+            weak = False
             hit = None
             if isinstance(node, ast.Name):
                 hit = node.id
             elif isinstance(node, ast.Attribute):
                 hit = node.attr
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                # a bare string is a mention (field names, getattr targets),
+                # not necessarily a read of the value
                 hit = node.value
+                weak = True
             if hit and (node.lineno, node.col_offset) not in transparent:
-                obs[hit][rel].append(node.lineno)
+                (obs_str if weak else obs)[hit][rel].append(node.lineno)
 
     obs_json = {k: {f: sorted(set(v)) for f, v in m.items()} for k, m in obs.items()}
+    obs_str_json = {k: {f: sorted(set(v)) for f, v in m.items()}
+                    for k, m in obs_str.items()}
     flows_json = {k: sorted(v) for k, v in flows.items()}
 
     # ---- fixture -> tests
@@ -335,7 +342,7 @@ def main():
     with open(os.path.join(OUT, "refs.json"), "w") as fh:
         json.dump(refs_json, fh, separators=(",", ":"))
     with gzip.open(os.path.join(OUT, "obs.json.gz"), "wt") as fh:
-        json.dump(obs_json, fh, separators=(",", ":"))
+        json.dump({"strong": obs_json, "weak": obs_str_json}, fh, separators=(",", ":"))
     with open(os.path.join(OUT, "flows.json"), "w") as fh:
         json.dump(flows_json, fh, separators=(",", ":"))
     for name in ("imports.json", "fixtures.json", "scopes.json", "refs.json", "flows.json"):

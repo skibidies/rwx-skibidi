@@ -15,6 +15,7 @@ rules allow (coverage, imports, fixtures):
 | --- | --- | --- |
 | `maps/coverage.json.gz` | one instrumented suite run with per-test line coverage | a failing test executes changed lines |
 | `maps/equiv.json.gz` | same run, comparisons dual-evaluated | a pure operator swap is invisible where both operators always agreed |
+| `maps/keys.json.gz` | same run, class-level containers recording lookups | a data change is only noticed by tests that read that key |
 | `maps/scopes.json` | AST of the pinned commit | function/class/multi-line-expression spans |
 | `maps/imports.json` | AST import graph | a module that cannot import fails every test that needs it |
 | `maps/fixtures.json` | suite run + static scan | fixture files are read by specific tests |
@@ -49,7 +50,7 @@ alternative comparison operators and record which tests saw disagreement
 
 ## Local score
 
-`make sample` on the 30 sample commits: **109.4 simulated s, 0 misses**
+`make sample` on the 30 sample commits: **104.1 simulated s, 0 misses**
 (oracle with perfect knowledge: 94.4 s). Every commit that breaks tests is
 selected at exactly its oracle cost; the rest is under 8 s per commit.
 

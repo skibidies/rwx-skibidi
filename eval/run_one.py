@@ -13,16 +13,21 @@ def main(short: str, out_dir: str, workers: str = "8") -> None:
     work = f"/tmp/w-{short}"
     if os.path.isdir(work):
         shutil.rmtree(work)
-    shutil.copytree("/src", work)
+    shutil.copytree("/src", work, ignore=shutil.ignore_patterns(".git"))
     patch = f"/patches/{short}.patch"
-    ap = subprocess.run(["git", "apply", "-p1", "--whitespace=nowarn", patch],
+    ap = subprocess.run(["patch", "-p1", "--batch", "-s", "-i", patch],
                         cwd=work, capture_output=True, text=True)
-    if ap.returncode != 0:
+    if short != "none" and ap.returncode != 0:
         res = {"short": short, "apply_error": ap.stderr.strip()[:2000]}
     else:
         xml = f"/tmp/r-{short}.xml"
+        targets = ["tests"]
+        if os.path.exists("/tests.txt"):
+            picked = [ln for ln in open("/tests.txt").read().split("\n") if ln.strip()]
+            if picked:
+                targets = picked
         subprocess.run(
-            [sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider",
+            [sys.executable, "-m", "pytest", *targets, "-q", "-p", "no:cacheprovider",
              "--tb=no", "-n", workers, f"--junitxml={xml}"],
             cwd=work, capture_output=True, text=True,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},

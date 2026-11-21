@@ -100,6 +100,160 @@ ALTS = {
 }
 
 
+# ---- container key observation -----------------------------------------
+
+KEYS = {}      # (relpath, line) -> {key: set(contexts)}
+KEY_BUDGET = {}  # relpath -> recorded events (guards a runaway hot line)
+KEY_BUDGET_MAX = 400_000
+
+
+def _key_name(obj):
+    """Normalize a looked-up key to the form the selector derives from the
+    source: strings/bools/numeric verbatim, classes and enums by name."""
+    if isinstance(obj, bool):
+        return repr(obj)
+    if isinstance(obj, (str, int, float)):
+        return str(obj)
+    name = getattr(obj, "__name__", None)
+    if isinstance(name, str):
+        return name
+    try:
+        return str(obj)
+    except Exception:
+        return "*"
+
+
+def _record_key(key, relpath, line, star=False):
+    sink = KEYS.setdefault((relpath, line), {})
+    k = "*" if star else _key_name(key)
+    sink.setdefault(k or "*", set()).add(current())
+
+
+class _Rec:
+    """Records which keys a test reads from one constant container."""
+
+    def __init__(self, relpath, line):
+        self._relpath = relpath
+        self._line = line
+        self._watchers = []
+
+    def _note(self, key=None, star=False):
+        _record_key(key, self._relpath, self._line, star)
+        for relpath, line in self._watchers:  # a merged-in constant is read too
+            _record_key(key, relpath, line, star)
+
+
+class _RecDict(dict, _Rec):
+    def __init__(self, *a, relpath, line, **k):
+        dict.__init__(self, *a, **k)
+        _Rec.__init__(self, relpath, line)
+
+    def get(self, key, default=None):
+        self._note(key)
+        return dict.get(self, key, default)
+
+    def __getitem__(self, key):
+        self._note(key)
+        return dict.__getitem__(self, key)
+
+    def __contains__(self, key):
+        self._note(key)
+        return dict.__contains__(self, key)
+
+    def pop(self, *a):
+        self._note(a[0] if a else None, star=not a)
+        return dict.pop(self, *a)
+
+    def setdefault(self, key, default=None):
+        self._note(key)
+        return dict.setdefault(self, key, default)
+
+    def keys(self):
+        self._note(star=True)
+        return dict.keys(self)
+
+    def values(self):
+        self._note(star=True)
+        return dict.values(self)
+
+    def items(self):
+        self._note(star=True)
+        return dict.items(self)
+
+    def __iter__(self):
+        self._note(star=True)
+        return dict.__iter__(self)
+
+    def __reduce__(self):
+        return (_rebuild, (dict, dict(self), self._relpath, self._line))
+
+
+class _RecSet(set, _Rec):
+    def __init__(self, *a, relpath, line, **k):
+        set.__init__(self, *a, **k)
+        _Rec.__init__(self, relpath, line)
+
+    def __contains__(self, key):
+        self._note(key)
+        return set.__contains__(self, key)
+
+    def __iter__(self):
+        self._note(star=True)
+        return set.__iter__(self)
+
+    def pop(self):
+        self._note(star=True)
+        return set.pop(self)
+
+    def __reduce__(self):
+        return (_rebuild, (set, set(self), self._relpath, self._line))
+
+
+class _RecList(list, _Rec):
+    def __init__(self, *a, relpath, line, **k):
+        list.__init__(self, *a, **k)
+        _Rec.__init__(self, relpath, line)
+
+    def __getitem__(self, key):
+        self._note(key, star=isinstance(key, slice))
+        return list.__getitem__(self, key)
+
+    def __iter__(self):
+        self._note(star=True)
+        return list.__iter__(self)
+
+    def __reduce__(self):
+        return (_rebuild, (list, list(self), self._relpath, self._line))
+
+
+_TYPES = {dict: _RecDict, set: _RecSet, list: _RecList}
+
+
+def _rebuild(base, payload, relpath, line):
+    if base is dict:
+        return _RecDict(payload, relpath=relpath, line=line)
+    if base is set:
+        return _RecSet(payload, relpath=relpath, line=line)
+    return _RecList(payload, relpath=relpath, line=line)
+
+
+def _br_data(value, *sources, relpath, line):
+    """Wrap a class/module-level container so reads of its keys are recorded,
+    and make it report the reads of anything that merges it (`{**CONST}`)."""
+    if not isinstance(value, (dict, set, list)):
+        return value
+    rec = _TYPES.get(type(value))
+    if rec is None:
+        return value
+    wrapped = rec(value, relpath=relpath, line=line)
+    # a later copy of this value must report back here: the constant is read
+    # through whatever it was merged into
+    for src in sources:
+        if isinstance(src, _Rec):
+            src._watchers.append((relpath, line))
+    return wrapped
+
+
 def _br_cmp(operands, op, fpath, lo, hi):
     """Original comparison with the source operator, then dual-evaluate the
     alternatives and record any disagreement per test context."""
@@ -140,6 +294,8 @@ class _CmpWrap(ast.NodeTransformer):
         self.relpath = relpath
         self.wrapped = set()
         self.skipped = set()
+        self.depth = 0  # >0 inside a function: not a class/module-level literal
+        self._in_data = 0  # >0 inside a class/module-level container literal
 
     def visit_Compare(self, node):
         self.generic_visit(node)
@@ -165,6 +321,67 @@ class _CmpWrap(ast.NodeTransformer):
         )
         return call
 
+    # -- class/module-level containers: record which keys tests read -----
+
+    def visit_FunctionDef(self, node):
+        self.depth += 1
+        self.generic_visit(node)
+        self.depth -= 1
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def _make_call(self, node):
+        """Wrap one container literal so reads of its keys are recorded."""
+        lo = node.lineno
+        sources = []
+        if isinstance(node, ast.Dict):
+            # `**x` produces a None key with the operand in values: reads of
+            # the merged-in constant must be credited to that constant too
+            sources = [v for k, v in zip(node.keys, node.values) if k is None]
+        call = ast.copy_location(
+            ast.Call(
+                func=ast.Name("_br_data", ast.Load()),
+                args=[node] + sources,
+                keywords=[
+                    ast.keyword("relpath", ast.Constant(self.relpath)),
+                    ast.keyword("line", ast.Constant(lo)),
+                ],
+            ),
+            node,
+        )
+        return call
+
+    def _wrap_data(self, node, line=None):
+        """At class/module level a container literal is data: wrap it, and
+        every container nested inside it, at its own line."""
+        if not isinstance(node, (ast.Dict, ast.Set, ast.List)):
+            return node
+        self._in_data += 1
+        node = self.generic_visit(node)
+        self._in_data -= 1
+        return self._make_call(node)
+
+    def visit_Dict(self, node):
+        return self._wrap_data(node) if self._in_data else self.generic_visit(node)
+
+    visit_Set = visit_Dict
+    visit_List = visit_Dict
+
+    def visit_Assign(self, node):
+        if self.depth == 0 and self._in_data == 0 and node.value is not None:
+            node.value = self._wrap_data(node.value, node.value.lineno)
+        else:
+            self.generic_visit(node)
+        return node
+
+    def visit_AnnAssign(self, node):
+        if self.depth == 0 and self._in_data == 0 and node.value is not None:
+            node.value = self._wrap_data(node.value, node.lineno)
+        else:
+            self.generic_visit(node)
+        return node
+
 
 class _TransformLoader:
     def __init__(self, loader, relpath):
@@ -187,6 +404,7 @@ class _TransformLoader:
             TRANSFORMED.add(self._relpath)
             return self._loader.exec_module(module)
         module.__dict__["_br_cmp"] = _br_cmp
+        module.__dict__["_br_data"] = _br_data
         WRAPPED.setdefault(self._relpath, set()).update(tr.wrapped)
         SKIPPED.setdefault(self._relpath, set()).update(tr.skipped)
         TRANSFORMED.add(self._relpath)
@@ -308,3 +526,9 @@ def pytest_sessionfinish(session, exitstatus):
     with _orig_open("/maps/equiv.json", "w") as fh:
         json.dump(equiv, fh, separators=(",", ":"))
     print(f"equiv.json: {len(equiv['lines'])} files with comparison records")
+
+    keys = {f"{f}:{l}": {k: sorted(v) for k, v in m.items()}
+            for (f, l), m in KEYS.items()}
+    with _orig_open("/maps/keys.json", "w") as fh:
+        json.dump(keys, fh, separators=(",", ":"))
+    print(f"keys.json: {len(keys)} containers observed")

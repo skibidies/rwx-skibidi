@@ -89,6 +89,28 @@ def main() -> None:
     print("wrote", os.path.join(OUT, "coverage.json.gz"),
           os.path.getsize(os.path.join(OUT, "coverage.json.gz")), "bytes")
 
+    # compact the container-key map: nodeids -> test numbers, gzipped
+    raw_keys = os.path.join(OUT, "keys.json")
+    if os.path.exists(raw_keys):
+        with open(raw_keys) as fh:
+            keys = json.load(fh)
+        compact_keys = {}
+        for where, km in keys.items():
+            out_km = {}
+            for key, ctxs in km.items():
+                unknown = [c for c in ctxs if c and c not in number_of]
+                if unknown:
+                    raise RuntimeError(f"keys nodeids missing from tests.json: {unknown[:3]}")
+                nums = sorted(number_of[c] for c in ctxs if c in number_of)
+                if nums:
+                    out_km[key] = nums
+            if out_km:
+                compact_keys[where] = out_km
+        with gzip.open(os.path.join(OUT, "keys.json.gz"), "wt") as fh:
+            json.dump(compact_keys, fh, separators=(",", ":"))
+        os.remove(raw_keys)
+        print("wrote keys.json.gz", os.path.getsize(os.path.join(OUT, "keys.json.gz")), "bytes")
+
     # compact the comparison behaviour map: nodeids -> test numbers, gzipped
     raw_path = os.path.join(OUT, "equiv.json")
     if os.path.exists(raw_path):

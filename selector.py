@@ -32,6 +32,7 @@ MAPS = APP / "maps"
 SRC = Path(os.environ.get("BR_SRC", "/tmp/src"))
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
+IMPORTER_CAP = 120  # above this, only readers are selected
 REF_CAP = 600  # fall back to importers when a constant's readers are everywhere
 UNCLASSIFIABLE_RE = re.compile(
     r"(^|/)(setup\.py|pyproject\.toml|MANIFEST\.in|Makefile|requirements\.lock)$"
@@ -95,8 +96,28 @@ class Maps:
         self.equiv_skipped = {f: set(s) for f, s in equiv.get("_skipped", {}).items()}
 
         # value-flow map: obs reads a name, flows carries it to another name
-        self.obs = json.load(gzip.open(MAPS / "obs.json.gz", "rt"))
+        obs = json.load(gzip.open(MAPS / "obs.json.gz", "rt"))
+        self.obs = obs.get("strong", obs)
+        self.obs_str = obs.get("weak", {})
         self.flows = json.load(open(MAPS / "flows.json"))
+
+        # container key observation: which keys a test actually reads
+        self.keys = {}
+        if (MAPS / "keys.json.gz").exists():
+            self.keys = json.load(gzip.open(MAPS / "keys.json.gz", "rt"))
+
+    def keys_at(self, path, line, keys):
+        """Tests that read any of these keys from the container at path:line.
+        Returns None when the container was never observed."""
+        sink = self.keys.get(f"{path}:{line}")
+        if not sink:
+            return None
+        out: set[int] = set()
+        for key in keys:
+            out.update(sink.get(key, ()))
+        # a test that iterates the container sees every key and value
+        out.update(sink.get("*", ()))
+        return out
 
     def is_known(self, path) -> bool:
         return (path in self.scopes or path in self.file_tests or path in self.numbers_by_file)
@@ -331,10 +352,33 @@ class Selector:
         new_tree = parse_tree(new_text)
         import_unsafe = False
 
-        for h in info["hunks"]:
+        for hi, h in enumerate(info["hunks"]):
             dels, adds = h["del"], h["add"]
             k = min(len(dels), len(adds))
             pairs = list(zip(dels[:k], adds[:k]))
+            if self._is_data_hunk(h, old_tree, new_tree, spans):
+                # a class/module-level assignment: the change is data (a dict
+                # entry, a set member, a table row), not structure. Only the
+                # readers of that name can notice, and only a name/attribute
+                # that does not exist can break the import.
+                stmt = None
+                for ln, _t in adds or dels:
+                    stmt = self._class_assign(new_tree if adds else old_tree, ln) or stmt
+                texts = [t for _ln, t in (h["add"] + h["del"])]
+                keys = self._changed_keys(h, new_tree, old_tree)
+                precise = self._key_tests(path, self._container_line(h, old_tree, new_tree), keys)
+                if precise is not None:
+                    selected |= precise
+                    if self._needs_probe(h) and not self._imports_ok(path, new_text):
+                        return selected | self.tests_importing(path)
+                    selected |= self.tests_reading(path)
+                    continue
+                if stmt is not None and self._value_line(
+                        path, spans, h["old"], stmt, selected, texts):
+                    if self._needs_probe(h) and not self._imports_ok(path, new_text):
+                        return selected | self.tests_importing(path)
+                    continue
+                import_unsafe = True
             for (ln, dtext), (nln, atext) in pairs:
                 if executable(dtext) and executable(atext) and old_tree is not None and new_tree is not None:
                     got = self._swap_tests(path, ln, nln, old_tree, new_tree)
@@ -349,7 +393,8 @@ class Selector:
                         if _value_only(s_old, s_new):
                             # a literal value change: only the readers of the
                             # constant can notice it
-                            handled_value = self._value_line(path, spans, ln, s_old, selected)
+                            handled_value = self._value_line(
+                                path, spans, ln, s_old, selected, [dtext, atext])
                         if not handled_value:
                             import_unsafe = True
                 if executable(dtext):
@@ -402,19 +447,117 @@ class Selector:
                     stack.append(h)
         return seen
 
-    def _value_line(self, path, spans, ln, stmt, selected) -> bool:
-        """Value-only change of a module/class-level literal: the tests that
-        notice are the ones covering the constant's readers (through the
-        value-flow map). Returns False when the map cannot carry the case."""
-        if self._has_string_literal_anywhere(stmt):
-            return False  # string values are handles too: use the broad rules
-        selected |= self.tests_for_lines(path, [ln])
-        selected |= self.tests_for_span(path, innermost_span(
-            [s for s in spans if s[0] == "e"], ln))
+    @staticmethod
+    def _container_line(h, old_tree, new_tree):
+        """Line of the class/module-level container a data hunk edits: the
+        recorder wraps the whole assigned value, so this must be the value's
+        own line, not the innermost literal."""
+        for tree in (new_tree, old_tree):
+            if tree is None:
+                continue
+            for ln, _t in h["add"] + h["del"]:
+                stmt = Selector._class_assign(tree, ln)
+                value = getattr(stmt, "value", None) if stmt is not None else None
+                if value is not None and hasattr(value, "lineno"):
+                    return value.lineno
+        return None
+
+    @staticmethod
+    def _changed_keys(h, new_tree, old_tree) -> list[str]:
+        """Keys (or set members) added/removed by the hunk, normalized the way
+        the recorder names them."""
+        def names(tree, line):
+            out = set()
+            if tree is None:
+                return out
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Dict, ast.Set, ast.List, ast.Tuple)):
+                    s = node.lineno
+                    e = getattr(node, "end_lineno", s) or s
+                    if not (s <= line <= e):
+                        continue
+                    kids = (node.values if isinstance(node, ast.Dict) else node.elts)
+                    if isinstance(node, ast.Dict):
+                        kids = [k for k in node.keys if k is not None]
+                    for kid in kids:
+                        if getattr(kid, "lineno", None) != line:
+                            continue
+                        if isinstance(kid, ast.Constant):
+                            out.add(str(kid.value))
+                        elif isinstance(kid, ast.Attribute):
+                            out.add(kid.attr)
+                        elif isinstance(kid, ast.Name):
+                            out.add(kid.id)
+                        elif isinstance(kid, ast.Call):
+                            fn = kid.func
+                            out.add(getattr(fn, "attr", None) or getattr(fn, "id", ""))
+            return out
+
+        keys = set()
+        for ln, _t in h["add"]:
+            keys |= names(new_tree, ln)
+        for ln, _t in h["del"]:
+            keys |= names(old_tree, ln)
+        return sorted(k for k in keys if k)
+
+    def _key_tests(self, path, line, keys):
+        """Tests reading the changed keys of a container, or None when the
+        container was never observed or the key is unknown."""
+        if line is None or not keys:
+            return None
+        got = self.m.keys_at(path, line, keys)
+        if got is None:
+            return None
+        return got
+
+    @staticmethod
+    def _class_assign(tree, line):
+        """Innermost assignment statement covering a line, if any."""
+        if tree is None:
+            return None
+        best = None
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Assign, ast.AnnAssign)):
+                s = n.lineno
+                e = getattr(n, "end_lineno", s) or s
+                if s <= line <= e and (best is None or (e - s) < (best[2] - best[1])):
+                    best = (n, s, e)
+        return best[0] if best else None
+
+    def _is_data_hunk(self, h, old_tree, new_tree, spans) -> bool:
+        """A hunk that only edits class/module-level assignment contents."""
+        old_lns = [ln for ln, _t in h["del"]]
+        new_lns = [ln for ln, _t in h["add"]]
+        if not old_lns and not new_lns:
+            return False
+        for ln in old_lns:
+            if self._inside_function(spans, ln) or self._class_assign(old_tree, ln) is None:
+                return False
+        for ln in new_lns:
+            if self._inside_function(spans, ln) or self._class_assign(new_tree, ln) is None:
+                return False
+        return True
+
+    @staticmethod
+    def _needs_probe(h) -> bool:
+        """An added/removed name or attribute can fail the import (NameError,
+        AttributeError); plain literals cannot."""
+        for _ln, text in h["add"] + h["del"]:
+            code = re.sub(r"(['\"]).*?\1", "''", text.split("#", 1)[0])
+            if re.search(r"[A-Za-z_]\w*\s*[(.]", code) or re.search(r"\w+\s*\.\s*\w+", code):
+                return True
+        return False
+
+    def _value_line(self, path, spans, ln, stmt, selected, changed_texts=()) -> bool:
+        """Change of a class/module-level assignment: the tests that notice
+        are the ones covering the name's readers (through the value-flow
+        map). Returns False when the map cannot carry the case."""
         if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             return False
-        names: set[str] = set()
+        if any(_has_string_literal_text(t) for t in changed_texts):
+            return False  # a string is often a key/handle: use the broad rules
         targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        names: set[str] = set()
         for t in targets:
             for sub in ast.walk(t):
                 if isinstance(sub, ast.Name):
@@ -423,11 +566,15 @@ class Selector:
                     names.add(sub.attr)
         if not names:
             return False
+        out = self.tests_for_lines(path, [ln])
+        out |= self.tests_for_span(path, innermost_span(
+            [s for s in spans if s[0] == "e"], ln))
         importers = self.tests_importing(path)
-        out: set[int] = set()
         import_time = False
         for name in self._flow_closure(names):
-            for f, lines in self.m.obs.get(name, {}).items():
+            # a bare string mention is only used when there is no real read
+            hits = self.m.obs.get(name) or self.m.obs_str.get(name) or {}
+            for f, lines in hits.items():
                 if f == path:
                     out |= self.tests_for_lines(f, lines)
                     continue
@@ -438,10 +585,10 @@ class Selector:
                     # notice it
                     import_time = True
                 out |= self.tests_for_lines(f, lines)
-        if import_time:
+        if import_time and len(importers) <= IMPORTER_CAP:
             out |= importers
-        else:
-            # a reader can only see this constant if it loaded the defining
+        elif not import_time:
+            # a reader can only see this name if it loaded the defining
             # module: the read sites themselves are often shared and hot
             out &= importers
         if len(out) > REF_CAP:
@@ -661,6 +808,12 @@ def _value_only(stmt_old, stmt_new):
                ast.dump(_NormConst().visit(stmt_new), include_attributes=False)
     except Exception:
         return False
+
+
+def _has_string_literal_text(text: str) -> bool:
+    """True when a source line contains a string literal (quotes outside a
+    comment)."""
+    return bool(re.search(r"['\"]", text.split("#", 1)[0]))
 
 
 def _has_string_literal(node) -> bool:
