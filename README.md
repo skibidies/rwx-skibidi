@@ -14,6 +14,7 @@ rules allow (coverage, imports, fixtures):
 | map | built from | use |
 | --- | --- | --- |
 | `maps/coverage.json.gz` | one instrumented suite run with per-test line coverage | a failing test executes changed lines |
+| `maps/equiv.json.gz` | same run, comparisons dual-evaluated | a pure operator swap is invisible where both operators always agreed |
 | `maps/scopes.json` | AST of the pinned commit | function/class/multi-line-expression spans |
 | `maps/imports.json` | AST import graph | a module that cannot import fails every test that needs it |
 | `maps/fixtures.json` | suite run + static scan | fixture files are read by specific tests |
@@ -25,22 +26,28 @@ Selection rules, per changed line: tests covering the line (or its innermost
 multi-line expression, since short-circuit changes move execution inside one
 expression); enclosing-scope tests for added lines; import-failure semantics
 for module/class level and structural changes; reference-based sets for
-changed constants; AST-equal patches (comment-only) select nothing. The
+changed constants; AST-equal patches (comment-only) select nothing. A line
+pair differing only in one comparison operator is checked against the
+behaviour map: only tests that ever saw the two operators disagree can
+notice, and where both always agreed the swap is provably neutral. The
 chosen set is packed across 1..8 workers minimizing `busiest + 2 s/worker`.
 
-Two instrumented-suite tricks make the coverage map complete: sqlglot's
+Two instrumented-suite tricks make the maps complete: sqlglot's
 tests run fixture work in spawned processes (coverage misses them), so the
 map build routes pool work through traced threads and pickles calls/results
 like a real process boundary (`Expr.__reduce__` runs serde). Per-test
 coverage contexts are per-thread, because the coverage writer drops
-concurrent writes to one (file, context) bitmap.
+concurrent writes to one (file, context) bitmap. For the behaviour map every
+comparison in `sqlglot/` is rewritten at import to also evaluate the
+alternative comparison operators and record which tests saw disagreement
+(anything it cannot decide conservatively marks the test as able to notice).
 
 ## Local score
 
-`make sample` on the 30 sample commits: **164.8 simulated s, 0 misses**
+`make sample` on the 30 sample commits: **110.0 simulated s, 0 misses**
 (oracle with perfect knowledge: 94.4 s). Every commit that breaks tests is
-selected at exactly its oracle cost; the remainder is tests that execute
-changed code on commits that happen to break nothing.
+selected at exactly its oracle cost; the rest is under 8 s per commit except
+one constant change the rules cannot prove neutral.
 
 ## Build
 

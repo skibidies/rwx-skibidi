@@ -1,15 +1,26 @@
-"""Map-build instrumentation: attribute coverage contexts and file reads to
-the test that started the work, including work on thread pools.
+"""Map-build instrumentation. Injected as /src/tests/conftest.py at map build.
 
-Injected as /src/tests/conftest.py during the map build only. Writes
-/maps/reads.json: {"<nodeid>": ["sqlglot/x.py", ...]} for reads under /src.
+Records, for the pinned suite run:
+  /maps/reads.json   test -> files it reads as text
+  /maps/equiv.json   per comparison line: which tests ever saw the alternative
+                     operators disagree with the one in the source (so an
+                     operator swap is provably neutral for the other tests)
+
+Attribution: coverage contexts and reads are credited to the test that
+started the work, including thread pools and the spawned-process pools
+(routed through traced threads that pickle calls/results like a real
+process boundary, since Expr.__reduce__ runs serde).
 """
 
+import ast
 import builtins
+import importlib.abc
+import importlib.machinery
 import io
 import json
 import os
 import pickle
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -17,6 +28,13 @@ CURRENT = [""]
 _TL = threading.local()
 READS = {}
 PREFIX = "/src/"
+
+TRANSFORMED = set()
+WRAPPED = {}   # file -> set of lines with a wrapped comparison
+SKIPPED = {}   # file -> set of lines with a comparison we did not wrap
+RECORD = {}    # (file, line, alt_op) -> [bad ctxs, unsure ctxs]
+BUDGET = {}    # (file, line, alt_op) -> evaluations left
+BUDGET_PER_KEY = 200_000
 
 
 def current() -> str:
@@ -52,6 +70,149 @@ def _io_open(file, *args, **kwargs):
 
 builtins.open = _open
 io.open = _io_open
+
+
+# ---- comparison dual evaluation ----------------------------------------
+
+FAMILY = {
+    "is": ("is not", "==", "!="),
+    "is not": ("is", "==", "!="),
+    "==": ("is", "is not", "!="),
+    "!=": ("is", "is not", "=="),
+    "<": ("<=", ">", ">="),
+    "<=": ("<", ">", ">="),
+    ">": ("<", "<=", ">="),
+    ">=": ("<", "<=", ">"),
+    "in": ("not in",),
+    "not in": ("in",),
+}
+ALTS = {
+    "is": lambda a, b: a is b,
+    "is not": lambda a, b: a is not b,
+    "==": lambda a, b: a == b,
+    "!=": lambda a, b: a != b,
+    "<": lambda a, b: a < b,
+    "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b,
+    ">=": lambda a, b: a >= b,
+    "in": lambda a, b: a in b,
+    "not in": lambda a, b: a not in b,
+}
+
+
+def _br_cmp(operands, op, fpath, lo, hi):
+    """Original comparison with the source operator, then dual-evaluate the
+    alternatives and record any disagreement per test context."""
+    a, b = operands
+    out = ALTS[op](a, b)
+    ctx = current()
+    for alt in FAMILY[op]:
+        for line in range(lo, hi + 1):
+            key = (fpath, line, alt)
+            budget = BUDGET.get(key)
+            if budget is None:
+                budget = BUDGET_PER_KEY
+            if budget <= 0:
+                RECORD.setdefault(key, [set(), set()])[1].add(ctx)
+                continue
+            BUDGET[key] = budget - 1
+            try:
+                other = ALTS[alt](a, b)
+                ok = type(other) is bool
+            except Exception:
+                ok = False
+            if not ok:
+                RECORD.setdefault(key, [set(), set()])[1].add(ctx)
+            elif bool(other) != bool(out):
+                RECORD.setdefault(key, [set(), set()])[0].add(ctx)
+    return out
+
+
+OPNAME = {
+    ast.Is: "is", ast.IsNot: "is not", ast.Eq: "==", ast.NotEq: "!=",
+    ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
+    ast.In: "in", ast.NotIn: "not in",
+}
+
+
+class _CmpWrap(ast.NodeTransformer):
+    def __init__(self, relpath):
+        self.relpath = relpath
+        self.wrapped = set()
+        self.skipped = set()
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        lo = node.lineno
+        hi = getattr(node, "end_lineno", lo) or lo
+        if len(node.ops) != 1 or not all(type(o) in OPNAME for o in node.ops):
+            self.skipped.update(range(lo, hi + 1))
+            return node
+        self.wrapped.update(range(lo, hi + 1))
+        call = ast.copy_location(
+            ast.Call(
+                func=ast.Name("_br_cmp", ast.Load()),
+                args=[
+                    ast.Tuple([node.left, node.comparators[0]], ast.Load()),
+                    ast.Constant(OPNAME[type(node.ops[0])]),
+                    ast.Constant(self.relpath),
+                    ast.Constant(lo),
+                    ast.Constant(hi),
+                ],
+                keywords=[],
+            ),
+            node,
+        )
+        return call
+
+
+class _TransformLoader:
+    def __init__(self, loader, relpath):
+        self._loader = loader
+        self._relpath = relpath
+
+    def create_module(self, spec):
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module):
+        try:
+            src = self._loader.get_source(module.__name__)
+            tree = ast.parse(src, filename=self._relpath)
+            tr = _CmpWrap(self._relpath)
+            tree = tr.visit(tree)
+            ast.fix_missing_locations(tree)
+            code = compile(tree, self._relpath, "exec", dont_inherit=True)
+        except Exception:
+            SKIPPED.setdefault(self._relpath, set()).update(range(1, 10_000))
+            TRANSFORMED.add(self._relpath)
+            return self._loader.exec_module(module)
+        module.__dict__["_br_cmp"] = _br_cmp
+        WRAPPED.setdefault(self._relpath, set()).update(tr.wrapped)
+        SKIPPED.setdefault(self._relpath, set()).update(tr.skipped)
+        TRANSFORMED.add(self._relpath)
+        exec(code, module.__dict__)
+
+
+class _TransformFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if not (name == "sqlglot" or name.startswith("sqlglot.")):
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        if spec is None or spec.loader is None:
+            return spec
+        relpath = os.path.relpath(spec.origin, SRC_ROOT)
+        spec.loader = _TransformLoader(spec.loader, relpath)
+        return spec
+
+
+SRC_ROOT = "/src"
+
+
+def _install_finder():
+    sys.meta_path.insert(0, _TransformFinder())
+
+
+_install_finder()
 
 
 # ---- thread context propagation ----------------------------------------
@@ -113,23 +274,6 @@ def _psubmit(self, fn, /, *args, **kwargs):
 ProcessPoolExecutor.__init__ = _pinit
 ProcessPoolExecutor.submit = _psubmit
 
-_orig_run = threading.Thread.run
-
-
-def _run(self):
-    _TL.id = current()
-    try:
-        import coverage
-        cov = coverage.Coverage.current()
-        if cov is not None and _TL.id:
-            cov.switch_context(f"{_TL.id}|t{threading.get_ident()}")
-    except Exception:
-        pass
-    return _orig_run(self)
-
-
-threading.Thread.run = _run
-
 
 # ---- pytest hooks ------------------------------------------------------
 
@@ -149,3 +293,18 @@ def pytest_sessionfinish(session, exitstatus):
     with _orig_open("/maps/reads.json", "w") as fh:
         json.dump(out, fh, separators=(",", ":"))
     print(f"reads.json: {len(out)} tests with file reads")
+
+    equiv = {
+        "_transformed": sorted(TRANSFORMED),
+        "_wrapped": {f: sorted(s) for f, s in WRAPPED.items()},
+        "_skipped": {f: sorted(s) for f, s in SKIPPED.items()},
+        "lines": {},
+    }
+    for (f, line, alt), (bad, unsure) in RECORD.items():
+        equiv["lines"].setdefault(f, {}).setdefault(str(line), {})[alt] = {
+            "bad": sorted(bad),
+            "unsure": sorted(unsure),
+        }
+    with _orig_open("/maps/equiv.json", "w") as fh:
+        json.dump(equiv, fh, separators=(",", ":"))
+    print(f"equiv.json: {len(equiv['lines'])} files with comparison records")

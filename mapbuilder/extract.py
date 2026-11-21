@@ -89,6 +89,41 @@ def main() -> None:
     print("wrote", os.path.join(OUT, "coverage.json.gz"),
           os.path.getsize(os.path.join(OUT, "coverage.json.gz")), "bytes")
 
+    # compact the comparison behaviour map: nodeids -> test numbers, gzipped
+    raw_path = os.path.join(OUT, "equiv.json")
+    if os.path.exists(raw_path):
+        with open(raw_path) as fh:
+            equiv = json.load(fh)
+        lines = {}
+        for f, lm in equiv.get("lines", {}).items():
+            out_lm = {}
+            for ln, am in lm.items():
+                out_am = {}
+                for op, ent in am.items():
+                    unknown = [c for c in ent["bad"] + ent["unsure"] if c and c not in number_of]
+                    if unknown:
+                        raise RuntimeError(f"equiv nodeids missing from tests.json: {unknown[:3]}")
+                    bad = [number_of[c] for c in ent["bad"] if c in number_of]
+                    unsure = [number_of[c] for c in ent["unsure"] if c in number_of]
+                    if "" in ent["bad"] or "" in ent["unsure"]:
+                        bad.append(-1)  # import-time effect marker
+                    if bad or unsure:
+                        out_am[op] = [sorted(bad), sorted(unsure)]
+                if out_am:
+                    out_lm[ln] = out_am
+            if out_lm:
+                lines[f] = out_lm
+        compact = {
+            "_transformed": equiv.get("_transformed", []),
+            "_wrapped": equiv.get("_wrapped", {}),
+            "_skipped": equiv.get("_skipped", {}),
+            "lines": lines,
+        }
+        with gzip.open(os.path.join(OUT, "equiv.json.gz"), "wt") as fh:
+            json.dump(compact, fh, separators=(",", ":"))
+        os.remove(raw_path)
+        print("wrote equiv.json.gz", os.path.getsize(os.path.join(OUT, "equiv.json.gz")), "bytes")
+
 
 def ranges(sorted_lines):
     out = []

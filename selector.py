@@ -86,6 +86,13 @@ class Maps:
                 self.reader_tests.setdefault(f, set()).update(nums)
         self.numbers_by_file = file_nums
 
+        # comparison dual-evaluation behaviour map
+        equiv = json.load(gzip.open(MAPS / "equiv.json.gz", "rt"))
+        self.equiv_lines = equiv.get("lines", {})
+        self.equiv_transformed = set(equiv.get("_transformed", []))
+        self.equiv_wrapped = {f: set(s) for f, s in equiv.get("_wrapped", {}).items()}
+        self.equiv_skipped = {f: set(s) for f, s in equiv.get("_skipped", {}).items()}
+
     def is_known(self, path) -> bool:
         return (path in self.scopes or path in self.file_tests or path in self.numbers_by_file)
 
@@ -120,17 +127,20 @@ def parse_patch(text: str):
             h = {
                 "old": int(m.group(1)),
                 "old_n": int(m.group(2) or 1),
+                "new": int(m.group(3)),
                 "del": [],   # (old lineno, text)
                 "add": [],   # (new lineno, text)
                 "newtext": [],  # new-side text of the hunk
             }
             cur["hunks"].append(h)
             cur["_ol"] = h["old"]
+            cur["_nl"] = h["new"]
         elif cur is not None and cur["hunks"]:
             h = cur["hunks"][-1]
             if line.startswith("+"):
-                h["add"].append((0, line[1:]))
+                h["add"].append((cur["_nl"], line[1:]))
                 h["newtext"].append(line[1:])
+                cur["_nl"] += 1
             elif line.startswith("-"):
                 h["del"].append((cur["_ol"], line[1:]))
                 cur["_ol"] += 1
@@ -139,6 +149,7 @@ def parse_patch(text: str):
             else:  # context (a dropped trailing space is context too)
                 h["newtext"].append(line[1:] if line.startswith(" ") else line)
                 cur["_ol"] += 1
+                cur["_nl"] += 1
     return files
 
 
@@ -282,12 +293,19 @@ class Selector:
         spans = self.m.scopes.get(path, [])
         need_import = False
         add_points = []
+        old_tree = parse_tree(old_text) if old_text is not None else None
+        new_tree = parse_tree("\n".join(new_lines))
 
         for h in info["hunks"]:
             dels, adds = h["del"], h["add"]
             k = min(len(dels), len(adds))
             pairs = list(zip(dels[:k], adds[:k]))
-            for (ln, dtext), (_n, atext) in pairs:
+            for (ln, dtext), (nln, atext) in pairs:
+                if executable(dtext) and executable(atext) and old_tree is not None and new_tree is not None:
+                    got = self._swap_tests(path, ln, nln, old_tree, new_tree)
+                    if got is not None:
+                        selected |= got
+                        continue
                 if executable(dtext):
                     need_import |= self._old_line(path, spans, ln, dtext, selected)
                 elif executable(atext):
@@ -315,6 +333,39 @@ class Selector:
             if not selected and UNCLASSIFIABLE_RE.search(path):
                 selected |= set(self.m.all_numbers)
         return selected
+
+    def _swap_tests(self, path, ln, nln, old_tree, new_tree):
+        """If the changed line pair is a pure comparison-operator swap, the
+        behaviour map says which tests ever saw the two operators disagree:
+        only those can notice. Returns None when unproven (fall back)."""
+        stmt_old = innermost_stmt(old_tree, ln)
+        stmt_new = innermost_stmt(new_tree, nln)
+        new_op = detect_swap(stmt_old, stmt_new)
+        if new_op is None:
+            return None
+        if path not in self.m.equiv_transformed:
+            return None  # source was not instrumented: no proof
+        wrapped = self.m.equiv_wrapped.get(path, set())
+        skipped = self.m.equiv_skipped.get(path, set())
+        lines = set()
+        for n in ast.walk(stmt_old):
+            if isinstance(n, ast.Compare) and n.lineno <= ln <= (getattr(n, "end_lineno", n.lineno) or n.lineno):
+                lines.update(range(n.lineno, (getattr(n, "end_lineno", n.lineno) or n.lineno) + 1))
+        if not lines:
+            return None
+        file_map = self.m.equiv_lines.get(path, {})
+        out: set[int] = set()
+        for l in lines:
+            if l in skipped or l not in wrapped:
+                return None  # comparison not instrumented at this line
+            ent = file_map.get(str(l), {}).get(new_op)
+            if ent is None:
+                continue  # never executed: nothing can notice
+            bad, unsure = ent
+            if -1 in bad or -1 in unsure:
+                return None  # import-time effects: keep the safe selection
+            out |= set(bad) | set(unsure)
+        return out
 
     def _old_line(self, path, spans, ln, text, selected) -> bool:
         """Classify one changed old line. Returns True if import-relevant."""
@@ -358,6 +409,83 @@ def ast_signature(src: str):
         return ast.dump(ast.parse(src), include_attributes=False)
     except (SyntaxError, ValueError, TypeError):
         return None
+
+
+def parse_tree(src: str):
+    try:
+        return ast.parse(src)
+    except (SyntaxError, ValueError, TypeError):
+        return None
+
+
+# ---- comparison-operator swap detection --------------------------------
+
+OP_UNIVERSE = {
+    "Eq": "==", "NotEq": "!=", "Is": "is", "IsNot": "is not",
+    "Lt": "<", "LtE": "<=", "Gt": ">", "GtE": ">=",
+    "In": "in", "NotIn": "not in",
+}
+
+
+class _NormOps(ast.NodeTransformer):
+    """Replace operator nodes with their category so dumps compare equal
+    when only the operator changed."""
+
+
+def _mk_visit(category):
+    def visit(self, node):
+        return ast.copy_location(ast.Constant(value=category), node)
+    return visit
+
+
+for _cat, _names in {
+    "cmpop": ("Eq", "NotEq", "Lt", "LtE", "Gt", "GtE", "Is", "IsNot", "In", "NotIn"),
+    "boolop": ("And", "Or"),
+    "unaryop": ("Not", "UAdd", "USub", "Invert"),
+    "operator": ("Add", "Sub", "Mult", "MatMult", "Div", "Mod", "Pow",
+                  "LShift", "RShift", "BitOr", "BitXor", "BitAnd", "FloorDiv"),
+}.items():
+    for _name in _names:
+        setattr(_NormOps, f"visit_{_name}", _mk_visit(_cat))
+
+
+def _op_names(node):
+    return [type(n).__name__ for n in ast.walk(node)
+            if isinstance(n, (ast.cmpop, ast.boolop, ast.unaryop, ast.operator))]
+
+
+def detect_swap(stmt_old, stmt_new):
+    """If the two statements differ only in one operator, return the new
+    operator's comparison name (e.g. '=='), else None."""
+    if stmt_old is None or stmt_new is None:
+        return None
+    o_ops, n_ops = _op_names(stmt_old), _op_names(stmt_new)
+    if len(o_ops) != len(n_ops):
+        return None
+    pairs = [(o, n) for o, n in zip(o_ops, n_ops) if o != n]
+    if len(pairs) != 1:
+        return None
+    o_op, n_op = pairs[0]
+    if o_op not in OP_UNIVERSE or n_op not in OP_UNIVERSE:
+        return None
+    try:
+        if ast.dump(_NormOps().visit(stmt_old), include_attributes=False) != \
+           ast.dump(_NormOps().visit(stmt_new), include_attributes=False):
+            return None
+    except Exception:
+        return None
+    return OP_UNIVERSE[n_op]
+
+
+def innermost_stmt(tree, line):
+    best = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.stmt):
+            s = n.lineno
+            e = getattr(n, "end_lineno", s) or s
+            if s <= line <= e and (best is None or (e - s) < (best[2] - best[1])):
+                best = (n, s, e)
+    return best[0] if best else None
 
 
 # ---------------------------------------------------------------- packing
