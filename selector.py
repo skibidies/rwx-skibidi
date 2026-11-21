@@ -93,30 +93,44 @@ class Maps:
                 self.reader_tests.setdefault(f, set()).update(nums)
         self.numbers_by_file = file_nums
 
-        # comparison dual-evaluation behaviour map
-        equiv = json.load(gzip.open(MAPS / "equiv.json.gz", "rt"))
-        self.equiv_lines = equiv.get("lines", {})
-        self.equiv_transformed = set(equiv.get("_transformed", []))
-        self.equiv_wrapped = {f: set(s) for f, s in equiv.get("_wrapped", {}).items()}
-        self.equiv_skipped = {f: set(s) for f, s in equiv.get("_skipped", {}).items()}
+        self._equiv = self._obs = self._flows = self._symbols = self._keys = None
 
-        # value-flow map: obs reads a name, flows carries it to another name
-        obs = json.load(gzip.open(MAPS / "obs.json.gz", "rt"))
-        self.obs = obs.get("strong", obs)
-        self.obs_str = obs.get("weak", {})
-        self.flows = json.load(open(MAPS / "flows.json"))
+    # -- maps that only some commits need, loaded on first use -------------
 
-        # names defined under sqlglot/: lets an added reference be verified
-        # without paying for a real import
-        self.symbols = set()
-        sym = MAPS / "symbols.json.gz"
-        if sym.exists():
-            self.symbols = set(json.load(gzip.open(sym, "rt")))
+    def _lazy(self, slot, loader):
+        value = getattr(self, slot)
+        if value is None:
+            value = loader()
+            setattr(self, slot, value)
+        return value
 
-        # container key observation: which keys a test actually reads
-        self.keys = {}
-        if (MAPS / "keys.json.gz").exists():
-            self.keys = json.load(gzip.open(MAPS / "keys.json.gz", "rt"))
+    @property
+    def equiv(self):
+        return self._lazy("_equiv", lambda: json.load(gzip.open(MAPS / "equiv.json.gz", "rt")))
+
+    @property
+    def obs(self):
+        return self._lazy("_obs", lambda: json.load(gzip.open(MAPS / "obs.json.gz", "rt")).get(
+            "strong") or {})
+
+    @property
+    def obs_str(self):
+        return self._lazy("_obs", lambda: json.load(gzip.open(MAPS / "obs.json.gz", "rt"))).get(
+            "weak", {})
+
+    @property
+    def flows(self):
+        return self._lazy("_flows", lambda: json.load(open(MAPS / "flows.json")))
+
+    @property
+    def symbols(self):
+        return self._lazy("_symbols", lambda: set(json.load(gzip.open(MAPS / "symbols.json.gz", "rt"))
+                                                 if (MAPS / "symbols.json.gz").exists() else []))
+
+    @property
+    def keys(self):
+        return self._lazy("_keys", lambda: json.load(gzip.open(MAPS / "keys.json.gz", "rt"))
+                          if (MAPS / "keys.json.gz").exists() else {})
 
     def keys_at(self, path, line, keys):
         """Tests that read any of these keys from the container at path:line.
@@ -368,14 +382,12 @@ class Selector:
             dels, adds = h["del"], h["add"]
             k = min(len(dels), len(adds))
             pairs = list(zip(dels[:k], adds[:k]))
-            if self._is_data_hunk(h, old_tree, new_tree, spans):
+            if self._is_data_hunk(h, old_tree, new_tree):
                 # a class/module-level assignment: the change is data (a dict
                 # entry, a set member, a table row), not structure. Only the
                 # readers of that name can notice, and only a name/attribute
                 # that does not exist can break the import.
-                stmt = None
-                for ln, _t in adds or dels:
-                    stmt = self._class_assign(new_tree if adds else old_tree, ln) or stmt
+                stmt = self._data_stmt(h, old_tree, new_tree)
                 texts = [t for _ln, t in (h["add"] + h["del"])]
                 keys = self._changed_keys(h, new_tree, old_tree)
                 precise = self._key_tests(path, self._container_line(h, old_tree, new_tree), keys)
@@ -411,16 +423,24 @@ class Selector:
                             import_unsafe = True
                 if executable(dtext):
                     if not handled_value:
-                        need_import |= self._old_line(path, spans, ln, dtext, selected)
+                        need_import |= self._old_line(
+                            path, spans, ln, dtext, selected, atext)
                 elif executable(atext):
-                    add_points.append(ln)
+                    if _is_import_line(atext):
+                        import_unsafe = True  # an added import only needs the probe
+                    else:
+                        add_points.append((ln, h))
             for ln, dtext in dels[k:]:
                 if executable(dtext):
                     if not self._inside_function(spans, ln):
                         import_unsafe = True
                     need_import |= self._old_line(path, spans, ln, dtext, selected)
-            if len(adds) > k:
-                add_points.append(dels[-1][0] if dels else h["old"])
+            extra = [t for _ln, t in adds[k:]]
+            if extra:
+                if all(_is_import_line(t) or not t.strip() for t in extra):
+                    import_unsafe = True  # added imports only need the probe
+                else:
+                    add_points.append((dels[-1][0] if dels else h["old"], h))
 
         # module/class-level changes can break the import (name errors, bad
         # imports). Probe the patched module: if it no longer imports, every
@@ -429,10 +449,14 @@ class Selector:
             if not self._imports_ok(path, new_text):
                 return selected | self.tests_importing(path)
 
-        for point in add_points:
+        for point, hunk in add_points:
             span = innermost_span(spans, point + 1) or innermost_span(spans, point)
             if span is not None and span[0] == "f":
                 selected |= self.tests_for_span(path, span)
+                continue
+            fn = self._fn_range_by_name(old_tree, new_tree, hunk)
+            if fn is not None:
+                selected |= self.tests_for_span(path, fn)
             else:
                 need_import = True
 
@@ -536,19 +560,80 @@ class Selector:
                     best = (n, s, e)
         return best[0] if best else None
 
-    def _is_data_hunk(self, h, old_tree, new_tree, spans) -> bool:
-        """A hunk that only edits class/module-level assignment contents."""
-        old_lns = [ln for ln, _t in h["del"]]
-        new_lns = [ln for ln, _t in h["add"]]
-        if not old_lns and not new_lns:
-            return False
-        for ln in old_lns:
-            if self._inside_function(spans, ln) or self._class_assign(old_tree, ln) is None:
-                return False
-        for ln in new_lns:
-            if self._inside_function(spans, ln) or self._class_assign(new_tree, ln) is None:
+    def _is_data_hunk(self, h, old_tree, new_tree, spans=None) -> bool:
+        """A hunk that only edits class/module-level data: assignment contents
+        or the documentation strings that sit beside them."""
+        for tree, pairs in ((old_tree, h["del"]), (new_tree, h["add"])):
+            lns = [ln for ln, t in pairs if t.strip() and not t.strip().startswith("#")]
+            for ln in lns:
+                if tree is None or _inside_fn_tree(tree, ln):
+                    return False
+                stmt = innermost_stmt(tree, ln)
+                if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                    continue
+                if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, str)):
+                    continue  # a documentation string next to the data
                 return False
         return True
+
+    @staticmethod
+    def _data_stmt(h, old_tree, new_tree):
+        """The assignment a data hunk edits, if it edits one."""
+        for tree, pairs in ((new_tree, h["add"]), (old_tree, h["del"])):
+            lns = [ln for ln, t in pairs if t.strip() and not t.strip().startswith("#")]
+            for ln in lns:
+                if tree is None:
+                    continue
+                stmt = innermost_stmt(tree, ln)
+                if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                    return stmt
+        return None
+
+    @staticmethod
+    def _fn_by_name(tree, line):
+        """Smallest function definition containing a line."""
+        best = None
+        if tree is None:
+            return None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                s = node.lineno
+                e = getattr(node, "end_lineno", s) or s
+                if s <= line <= e and (best is None or (e - s) < (best[2] - best[1])):
+                    best = (node, s, e)
+        return best
+
+    def _fn_range_by_name(self, old_tree, new_tree, hunk):
+        """Old-file line range of the function an addition lands in. Added lines
+        are numbered in the new file, so the function is found there by name."""
+        for ln, _t in hunk["add"]:
+            found = self._fn_by_name(new_tree, ln)
+            if found is None:
+                continue
+            name = found[0].name
+            if old_tree is None:
+                return None
+            candidates = [start for start, _e in self._all_fn_ranges(old_tree, name)]
+            if candidates:
+                start = min(candidates)
+                return ("f", start, self._range_end(old_tree, name, start), start)
+        return None
+
+    @staticmethod
+    def _all_fn_ranges(tree, name):
+        out = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                out.append((node.lineno, getattr(node, "end_lineno", node.lineno)))
+        return out
+
+    @staticmethod
+    def _range_end(tree, name, start):
+        for s, e in Selector._all_fn_ranges(tree, name):
+            if s == start:
+                return e
+        return start
 
     def _needs_probe(self, h) -> bool:
         """An added/removed reference to a name that does not exist under
@@ -568,7 +653,8 @@ class Selector:
         map). Returns False when the map cannot carry the case."""
         if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             return False
-        if any(_has_string_literal_text(t) for t in changed_texts):
+        texts = [t for t in changed_texts if not _is_docstring_line(t)]
+        if any(_has_string_literal_text(t) for t in texts):
             return False  # a string is often a key/handle: use the broad rules
         targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
         names: set[str] = set()
@@ -664,17 +750,18 @@ class Selector:
         new_op = detect_swap(stmt_old, stmt_new)
         if new_op is None:
             return None
-        if path not in self.m.equiv_transformed:
+        eq = self.m.equiv
+        if path not in set(eq.get("_transformed", [])):
             return None  # source was not instrumented: no proof
-        wrapped = self.m.equiv_wrapped.get(path, set())
-        skipped = self.m.equiv_skipped.get(path, set())
+        wrapped = set(eq.get("_wrapped", {}).get(path, []))
+        skipped = set(eq.get("_skipped", {}).get(path, []))
         lines = set()
         for n in ast.walk(stmt_old):
             if isinstance(n, ast.Compare) and n.lineno <= ln <= (getattr(n, "end_lineno", n.lineno) or n.lineno):
                 lines.update(range(n.lineno, (getattr(n, "end_lineno", n.lineno) or n.lineno) + 1))
         if not lines:
             return None
-        file_map = self.m.equiv_lines.get(path, {})
+        file_map = eq.get("lines", {}).get(path, {})
         out: set[int] = set()
         for l in lines:
             if l in skipped or l not in wrapped:
@@ -688,7 +775,7 @@ class Selector:
             out |= set(bad) | set(unsure)
         return out
 
-    def _old_line(self, path, spans, ln, text, selected) -> bool:
+    def _old_line(self, path, spans, ln, text, selected, new_text=None) -> bool:
         """Classify one changed old line. Returns True if import-relevant."""
         span = innermost_span(spans, ln)
 
@@ -709,8 +796,13 @@ class Selector:
             return False
 
         if ln == span[1] or ln < span[3]:
-            # def / decorator / signature line: import-relevant structure
+            # def / decorator / signature line: import-relevant only if the
+            # name itself changed (a rename breaks importing test files, a
+            # reshaped signature does not)
             selected |= self.tests_for_span(path, span)
+            old_name = _def_name(text)
+            if old_name and new_text and old_name == _def_name(new_text):
+                return False
             return True
 
         got = self.tests_for_lines(path, [ln])
@@ -822,6 +914,37 @@ def _value_only(stmt_old, stmt_new):
                ast.dump(_NormConst().visit(stmt_new), include_attributes=False)
     except Exception:
         return False
+
+
+DOCSTRING_STARTS = ('"""', "'''", 'r"""', "r'''")
+
+
+def _is_docstring_line(text: str) -> bool:
+    """A docstring line carries no behaviour (documentation is not a key)."""
+    return text.strip().startswith(DOCSTRING_STARTS)
+
+
+def _def_name(text: str):
+    m = re.search(r"\b(?:def|class)\s+(\w+)", text)
+    return m.group(1) if m else None
+
+
+def _is_import_line(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.startswith(("import ", "from ")) and "import" in stripped
+
+
+def _inside_fn_tree(tree, line: int) -> bool:
+    """True when the line sits inside a function or lambda body."""
+    if tree is None:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            s = node.lineno
+            e = getattr(node, "end_lineno", s) or s
+            if s <= line <= e:
+                return True
+    return False
 
 
 def _has_string_literal_text(text: str) -> bool:
