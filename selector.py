@@ -711,8 +711,10 @@ class Selector:
             # a reader can only see this name if it loaded the defining
             # module: the read sites themselves are often shared and hot
             out &= importers
-        if len(out) > REF_CAP:
-            return False  # too broad to trust the refinement: use the old rules
+        if len(out) > REF_CAP or not out:
+            # too broad to trust, or no reader found at all: fall back rather
+            # than claim that nothing can notice the change
+            return False
         selected |= out
         return True
 
