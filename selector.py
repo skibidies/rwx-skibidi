@@ -134,7 +134,9 @@ class Maps:
 
     def keys_at(self, path, line, keys):
         """Tests that read any of these keys from the container at path:line.
-        Returns None when the container was never observed."""
+        Returns None when the container was never observed, or when it was
+        only ever touched at import time (copied into a plain dict, say, so
+        its reads happen elsewhere)."""
         sink = self.keys.get(f"{path}:{line}")
         if not sink:
             return None
@@ -143,6 +145,8 @@ class Maps:
             out.update(sink.get(key, ()))
         # a test that iterates the container sees every key and value
         out.update(sink.get("*", ()))
+        if not out and not any(sink.values()):
+            return None  # no test-time read of this container: not proven
         return out
 
     def is_known(self, path) -> bool:
@@ -697,9 +701,13 @@ class Selector:
                     # notice it
                     import_time = True
                 out |= self.tests_for_lines(f, lines)
-        if import_time and len(importers) <= IMPORTER_CAP:
+        if import_time:
+            if len(importers) > IMPORTER_CAP:
+                # every module that loads this one can notice a value read at
+                # import time; too many to narrow, so use the broad rules
+                return False
             out |= importers
-        elif not import_time:
+        else:
             # a reader can only see this name if it loaded the defining
             # module: the read sites themselves are often shared and hot
             out &= importers
