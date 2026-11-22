@@ -707,10 +707,8 @@ class Selector:
                 # import time; too many to narrow, so use the broad rules
                 return False
             out |= importers
-        else:
-            # a reader can only see this name if it loaded the defining
-            # module: the read sites themselves are often shared and hot
-            out &= importers
+        # no importer intersection: dialects import each other lazily, so a
+        # test that reads the name need not be a static importer of the file
         if len(out) > REF_CAP or not out:
             # too broad to trust, or no reader found at all: fall back rather
             # than claim that nothing can notice the change
